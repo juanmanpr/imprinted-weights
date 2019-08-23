@@ -1,0 +1,7 @@
+__pycache__/*
+*.npy
+checkpoints/*
+imagenet/*
+CUB_200_2011/*
+*__pycache__*
+CUB_200_2011

@@ -13,16 +13,20 @@ import torch.utils.data
 import torchvision.transforms as transforms
 import models
 import loader
-import numpy as np
+
+import pdb
 
 from utils import Bar, Logger, AverageMeter, accuracy, mkdir_p, savefig
+
+from utils import ortho_reg
+import numpy as np
 
 parser = argparse.ArgumentParser(description='PyTorch ImageNet Training')
 parser.add_argument('--data', metavar='DIR', default='CUB_200_2011',
                     help='path to dataset')
-parser.add_argument('-j', '--workers', default=4, type=int, metavar='N',
+parser.add_argument('-j', '--workers', default=0, type=int, metavar='N',
                     help='number of data loading workers (default: 4)')
-parser.add_argument('-b', '--batch-size', default=64, type=int,
+parser.add_argument('-b', '--batch-size', default=1, type=int,
                     metavar='N', help='mini-batch size (default: 64)')
 parser.add_argument('--epochs', default=90, type=int, metavar='N',
                     help='number of total epochs to run')
@@ -41,7 +45,7 @@ parser.add_argument('--ortho-lambda', '--lambda', default=1e-4, type=float,
 parser.add_argument('-n', '--net-type', default='default', type=str, choices=['googlenet','default'],
                     help='network type (googlenet,default)')                    
 parser.add_argument('-c', '--checkpoint', default='checkpoints', type=str, metavar='PATH',
-                    help='path to save checkpoint (default: imprint_ft_checkpoint)')
+                    help='path to save checkpoint (default: weight_gen)')
 parser.add_argument('--model', default='', type=str, metavar='PATH',
                     help='path to model (default: none)')
 parser.add_argument('--resume', default='', type=str, metavar='PATH',
@@ -52,8 +56,9 @@ parser.add_argument('--random', action='store_true', help='whether use random no
 parser.add_argument('--num-sample', default=1, type=int,
                     metavar='N', help='number of novel sample (default: 1)')
 parser.add_argument('--test-novel-only', action='store_true', help='whether only test on novel classes')
-best_prec1 = 0
 
+
+best_prec1 = 0
 
 def main():
     global args, best_prec1
@@ -63,13 +68,13 @@ def main():
     conf_name += '_ortho' if args.ortho else '' 
     conf_name += ('_' + args.net_type) if args.net_type != 'default' else ''
     
-    args.checkpoint = os.path.join(args.checkpoint, conf_name, 'imprint_ft_checkpoint')
+    args.checkpoint = os.path.join(args.checkpoint, conf_name, 'dynamic_checkpoint')
 
     if not os.path.isdir(args.checkpoint):
         mkdir_p(args.checkpoint)
 
-    model = models.Net(extractor_type=args.net_type).cuda()
-
+    model = models.DynamicNet(extractor_type=args.net_type).cuda()
+    weight_generator = models.WeightGenerator()
 
     print('==> Reading from model checkpoint..')
     assert os.path.isfile(args.model), 'Error: no model checkpoint directory found!'
@@ -79,9 +84,25 @@ def main():
             .format(args.model, checkpoint['epoch']))
     cudnn.benchmark = True
 
-    # Data loading code
     normalize = transforms.Normalize(mean=[0.5, 0.5, 0.5],
                                      std=[0.5, 0.5, 0.5])
+
+    train_dataset = loader.EpisodicLoader(
+        args.data,
+        transforms.Compose([
+            transforms.RandomResizedCrop(224),
+            transforms.RandomHorizontalFlip(),
+            transforms.ToTensor(),
+            normalize,
+        ])
+    )
+
+    val_dataset = loader.EpisodicValLoader(args.data, transforms.Compose([
+            transforms.Resize(256),
+            transforms.CenterCrop(224),
+            transforms.ToTensor(),
+            normalize,
+        ]), novel_only=args.test_novel_only)
 
     novel_dataset = loader.ImageLoader(
         args.data, transforms.Compose([
@@ -94,47 +115,29 @@ def main():
         num_train_sample=args.num_sample, 
         novel_only=True)
 
-    novel_loader = torch.utils.data.DataLoader(
-        novel_dataset, batch_size=args.batch_size, shuffle=False,
-        num_workers=args.workers, pin_memory=True)
-
-    train_dataset = loader.ImageLoader(
-        args.data, transforms.Compose([
-            transforms.Resize(256),
-            transforms.RandomCrop(224),
-            transforms.RandomHorizontalFlip(),
-            transforms.ToTensor(),
-            normalize,
-        ]),
-        train=True, num_classes=200, 
-        num_train_sample=args.num_sample)
-
     train_loader = torch.utils.data.DataLoader(
-        train_dataset, batch_size=args.batch_size, sampler=train_dataset.get_balanced_sampler(),
+        train_dataset, batch_size=args.batch_size, shuffle=False,
         num_workers=args.workers, pin_memory=True)
 
     val_loader = torch.utils.data.DataLoader(
-        loader.ImageLoader(args.data, transforms.Compose([
-            transforms.Resize(256),
-            transforms.CenterCrop(224),
-            transforms.ToTensor(),
-            normalize,
-        ]), num_classes=200, novel_only=args.test_novel_only),
+        val_dataset,
         batch_size=args.batch_size, shuffle=False,
         num_workers=args.workers, pin_memory=True)
+ 
+    novel_loader = torch.utils.data.DataLoader(
+        novel_dataset, batch_size=args.batch_size, shuffle=False,
+        num_workers=args.workers, pin_memory=True) 
 
-    # imprint weights first
-    imprint(novel_loader, model)
 
     print('    Total params: %.2fM' % (sum(p.numel() for p in model.parameters())/1000000.0))
 
     # define loss function (criterion) and optimizer
     criterion = nn.CrossEntropyLoss().cuda()
 
-    optimizer = torch.optim.SGD(model.parameters(), lr=args.lr, momentum=args.momentum, weight_decay=args.weight_decay)
+    optimizer = torch.optim.SGD(weight_generator.parameters(), lr=args.lr, momentum=args.momentum, weight_decay=args.weight_decay)
     scheduler = torch.optim.lr_scheduler.StepLR(optimizer, step_size=4, gamma=0.94)
 
-    title = 'Impriningt + FT'
+    title = 'Episodic training of weight generator'
     if args.resume:
         print('==> Resuming from checkpoint..')
         assert os.path.isfile(args.resume), 'Error: no checkpoint directory found!'
@@ -159,7 +162,7 @@ def main():
         lr = optimizer.param_groups[0]['lr']
         print('\nEpoch: [%d | %d] LR: %f' % (epoch + 1, args.epochs, lr))
         # train for one epoch
-        train_loss, train_acc = train(train_loader, model, criterion, optimizer, epoch)
+        train_loss, train_acc = train(train_loader, model, weight_generator, criterion, optimizer, epoch)
 
         # evaluate on validation set
         test_loss, test_acc = validate(val_loader, model, criterion)
@@ -183,7 +186,6 @@ def main():
 
     print('Best acc:')
     print(best_prec1)
-
 
 def imprint(novel_loader, model):
     batch_time = AverageMeter()
@@ -232,7 +234,7 @@ def imprint(novel_loader, model):
     model.classifier.fc = nn.Linear(256, 200, bias=False)
     model.classifier.fc.weight.data = weight
 
-def train(train_loader, model, criterion, optimizer, epoch):
+def train(train_loader, model, weight_generator, criterion, optimizer, epoch):
     batch_time = AverageMeter()
     data_time = AverageMeter()
     losses = AverageMeter()
@@ -244,16 +246,37 @@ def train(train_loader, model, criterion, optimizer, epoch):
 
     end = time.time()
     bar = Bar('Training  ', max=len(train_loader))
-    for batch_idx, (input, target) in enumerate(train_loader):
+    for batch_idx, (base_samples, base_labels, fake_novel_samples, fake_novel_query, fake_novel_labels) in enumerate(train_loader):
         # measure data loading time
         data_time.update(time.time() - end)
-
-        input = input.cuda()
-        target = target.cuda(non_blocking=True)
         
-        # compute output
-        output = model(input)
+        base_samples            = torch.cat(base_samples).cuda()
+        base_labels             = torch.cat(base_labels).cuda()
+        fake_novel_samples      = torch.cat(fake_novel_samples).cuda()
+        fake_novel_labels       = torch.cat(fake_novel_labels).cuda()
+        fake_novel_query        = torch.cat(fake_novel_query).cuda()
+            
+        fake_train = model.extract(fake_novel_samples)
+        unique_novel_labels = torch.unique(fake_novel_labels)
+        
+        new_weight = torch.zeros(unique_novel_labels.shape[0], 256)
+        for i, f_l in enumerate(unique_novel_labels):
+            tmp = fake_train[fake_novel_labels == f_l].mean(0)
+            new_weight[i] = tmp / tmp.norm(p=2)
+        new_weight = new_weight.cuda()
+        
+        # compute output of the sampled 20-way classification problem
+        input = torch.cat((base_samples, fake_novel_query))
+        unique_base_labels = torch.unique(base_labels)
+        output = model(input, base_class_indexes = unique_base_labels, 
+                        novel_class_classifiers = new_weight,
+                        detach_feature=True)
+        
+        lst_lab = np.repeat(list(range(20)), 5)
+        target = torch.LongTensor(lst_lab).cuda()
+        
         loss = criterion(output, target)
+
 
         # measure accuracy and record loss
         prec1, prec5 = accuracy(output, target, topk=(1, 5))
@@ -335,13 +358,6 @@ def validate(val_loader, model, criterion):
             bar.next()
         bar.finish()
     return (losses.avg, top1.avg)
-
-
-def save_checkpoint(state, is_best, checkpoint='checkpoint', filename='checkpoint.pth.tar'):
-    filepath = os.path.join(checkpoint, filename)
-    torch.save(state, filepath)
-    if is_best:
-        shutil.copyfile(filepath, os.path.join(checkpoint, 'model_best.pth.tar'))
-
+    
 if __name__ == '__main__':
     main()
