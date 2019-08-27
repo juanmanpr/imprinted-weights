@@ -272,7 +272,7 @@ def train(train_loader, model, weight_generator, criterion, optimizer, epoch):
                         novel_class_classifiers = new_weight,
                         detach_feature=True)
         
-        lst_lab = np.repeat(list(range(20)), 5)
+        lst_lab = np.repeat(list(range(10)), 5)
         target = torch.LongTensor(lst_lab).cuda()
         
         loss = criterion(output, target)

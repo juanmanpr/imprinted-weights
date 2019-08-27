@@ -147,8 +147,8 @@ class EpisodicLoader(torch.utils.data.Dataset):
         class_indices_all = list(range(80))
         random.shuffle(class_indices_all)
         
-        class_indices_base = class_indices_all[:10]
-        class_indices_test = class_indices_all[10:20]
+        class_indices_base = class_indices_all[:5]
+        class_indices_test = class_indices_all[5:10]
         
         per_query_class_imgs = []
         per_novel_class_imgs = []
