@@ -164,9 +164,12 @@ class DynamicNet(nn.Module):
         if detach_feature:
             x = x.detach()
         
-        if base_class_indexes is not None:
+        if novel_class_classifiers is not None:
             #get classification weigths
-            weight_base = self.classifier.fc.weight[base_class_indexes]
+            if base_class_indexes is None:
+                weight_base = self.classifier.fc.weight        
+            else:
+                weight_base = self.classifier.fc.weight[base_class_indexes]
             weight = torch.cat((weight_base, novel_class_classifiers))
             
             # apply classifier

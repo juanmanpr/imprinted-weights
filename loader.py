@@ -134,7 +134,7 @@ class EpisodicLoader(torch.utils.data.Dataset):
         self.img_labels = np.array(self.imgs['label'].tolist())
         
     def __len__(self):
-        return 1000
+        return 500
                 
     def __getitem__(self, index):
         """
